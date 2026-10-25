@@ -73,6 +73,15 @@ class HourlyTemperaturePoint:
     value_c: float
 
 
+@dataclass(slots=True)
+class ContractTariff:
+    """Tariff/fee details from the contract endpoint."""
+
+    transfer_fee_incl_vat: float | None
+    energy_tax_incl_vat: float | None
+    fixed_fee_incl_vat_incl_discount: float | None
+
+
 class VattenfallApiClient:
     """Vattenfall API client."""
 
@@ -185,6 +194,22 @@ class VattenfallApiClient:
             if self._allow_stub_data:
                 _LOGGER.warning("Hourly temperature fetch failed, falling back to stub data: %s", err)
                 return self._build_stub_hourly_temperature_points(start_date, end_date)
+            if isinstance(err, VattenfallApiError):
+                raise
+            raise VattenfallApiError(f"Network error while calling Vattenfall API: {err}") from err
+
+    async def async_get_contract(self) -> ContractTariff:
+        """Fetch contract tariff/fee details from the API."""
+        try:
+            await self.async_authenticate()
+            return await self._async_fetch_contract()
+        except VattenfallAuthError:
+            await self.async_authenticate(force=True)
+            return await self._async_fetch_contract()
+        except (VattenfallApiError, httpx.HTTPError) as err:
+            if self._allow_stub_data:
+                _LOGGER.warning("Contract fetch failed, falling back to stub data: %s", err)
+                return self._build_stub_contract()
             if isinstance(err, VattenfallApiError):
                 raise
             raise VattenfallApiError(f"Network error while calling Vattenfall API: {err}") from err
@@ -507,6 +532,55 @@ class VattenfallApiClient:
 
         raise VattenfallApiError("Unexpected hourly temperature API payload shape; no points extracted")
 
+    async def _async_fetch_contract(self) -> ContractTariff:
+        """Fetch contract tariff/fee details from Vattenfall API."""
+        endpoint = f"{self._base_url}/contract/contract/{self._metering_point_id}"
+
+        headers = self._request_headers(
+            sec_fetch_dest="empty",
+            sec_fetch_mode="cors",
+            sec_fetch_site="same-site",
+            priority="u=1, i",
+        )
+        headers["accept"] = "application/json, text/plain, */*"
+        headers["ocp-apim-subscription-key"] = self._subscription_key
+
+        cookies: dict[str, str] = {}
+        for key in ("csrf-token", "VF_SecurityCookie", "VF_AccessCookie"):
+            value = self._cookie_value(key, domain_hint="vattenfalleldistribution.se")
+            if value:
+                cookies[key] = value
+
+        if not cookies.get("VF_SecurityCookie") or not cookies.get("VF_AccessCookie"):
+            raise VattenfallAuthError("Missing API auth cookies before contract request")
+
+        response = await self._async_get_with_retry(endpoint, headers, cookies, "contract")
+
+        if response.status_code in (401, 403):
+            raise VattenfallAuthError(
+                f"Unauthorized response from Vattenfall API (HTTP {response.status_code}): "
+                f"{response.text[:200]}"
+            )
+        if response.status_code == 500 and not response.text.strip():
+            raise VattenfallAuthError(
+                "Vattenfall API returned HTTP 500 with empty body when fetching contract — likely expired session"
+            )
+        if response.status_code >= 400:
+            raise VattenfallApiError(
+                f"Vattenfall API returned HTTP {response.status_code} when fetching contract: {response.text[:200] or '<empty response body>'}"
+            )
+
+        payload = response.json()
+        tariff = self._extract_contract_tariff(payload)
+        if tariff is not None:
+            return tariff
+
+        if self._allow_stub_data:
+            _LOGGER.warning("Unexpected contract API payload shape, falling back to stub data")
+            return self._build_stub_contract()
+
+        raise VattenfallApiError("Unexpected contract API payload shape; no tariff extracted")
+
     def _extract_session_data_key(self) -> str:
         """Extract `sessionDataKey` from `sessionNonceCookie-<key>` cookie name."""
         if self._client is None:
@@ -788,6 +862,31 @@ class VattenfallApiClient:
         points.sort(key=lambda p: p.date_time)
         return points
 
+    def _extract_contract_tariff(self, payload: Any) -> ContractTariff | None:
+        """Extract tariff/fee details from the contract API response payload."""
+        if not isinstance(payload, dict):
+            return None
+
+        def _as_float(key: str) -> float | None:
+            value = payload.get(key)
+            try:
+                return float(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        tariff = ContractTariff(
+            transfer_fee_incl_vat=_as_float("transferFeeInclVat"),
+            energy_tax_incl_vat=_as_float("energyTaxInclVat"),
+            fixed_fee_incl_vat_incl_discount=_as_float("fixedFeeInclVatInclDiscount"),
+        )
+        if (
+            tariff.transfer_fee_incl_vat is None
+            and tariff.energy_tax_incl_vat is None
+            and tariff.fixed_fee_incl_vat_incl_discount is None
+        ):
+            return None
+        return tariff
+
     def _flatten_points(self, payload: Any) -> list[dict[str, Any]]:
         """Flatten known/unknown payload shapes into a list of dict points."""
         if isinstance(payload, list):
@@ -886,3 +985,11 @@ class VattenfallApiClient:
             dt += timedelta(hours=1)
 
         return points
+
+    def _build_stub_contract(self) -> ContractTariff:
+        """Build deterministic contract stub data for development/testing."""
+        return ContractTariff(
+            transfer_fee_incl_vat=0.445,
+            energy_tax_incl_vat=0.45,
+            fixed_fee_incl_vat_incl_discount=2450.0,
+        )

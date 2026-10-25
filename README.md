@@ -21,6 +21,9 @@ dashboards, Energy, and automations.
   - Today average temperature
   - Today minimum temperature
   - Today maximum temperature
+  - Transfer fee incl. VAT (per kWh)
+  - Energy tax incl. VAT (per kWh)
+  - Fixed fee incl. VAT incl. discount
 - HACS compatible
 
 ## Installation

@@ -81,7 +81,7 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             month_start = end_date.replace(day=1)
             hourly_end = date.today()
             hourly_start = hourly_end - timedelta(days=1)
-            return await self._async_build_data(
+            data = await self._async_build_data(
                 daily_start=month_start,
                 daily_end=end_date,
                 hourly_start=hourly_start,
@@ -89,8 +89,19 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 temperature_start=hourly_start,
                 temperature_end=hourly_end,
             )
+            data.update(await self._async_fetch_contract_data())
+            return data
         except VattenfallApiError as err:
             raise UpdateFailed(f"Failed to fetch data from Vattenfall API: {err}") from err
+
+    async def _async_fetch_contract_data(self) -> dict[str, Any]:
+        """Fetch contract tariff/fee details and expose them as data keys."""
+        tariff = await self.client.async_get_contract()
+        return {
+            "transfer_fee_incl_vat": tariff.transfer_fee_incl_vat,
+            "energy_tax_incl_vat": tariff.energy_tax_incl_vat,
+            "fixed_fee_incl_vat_incl_discount": tariff.fixed_fee_incl_vat_incl_discount,
+        }
 
     async def async_backfill_range(
         self,
